@@ -1,0 +1,240 @@
+import os
+import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from torch.utils.data import Dataset
+from typing import Optional, Dict, Any
+from sklearn.model_selection import train_test_split
+from src.utils import load_chipwhisperer, generate_traces, calculate_HW, load_aes_hd_ext, \
+    load_ascad, load_ctf, load_ascon_2
+
+import torch
+
+
+class DatasetLoader:
+    """
+    统一的数据集加载器
+    支持多种数据集的加载和配置
+    """
+    
+    @staticmethod
+    def get_dataset_config(dataset: str, root: str = "./") -> Dict[str, Any]:
+        """
+        获取数据集特定的配置信息
+        """
+        configs = {
+            "ASCAD": {
+                "file_path": "/tmp/fast_datasets_cache/ASCAD.h5",
+                "byte": 2,
+                "load_func": load_ascad,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 10000}
+            },
+            "ASCAD_desync50": {
+                "file_path": "/tmp/fast_datasets_cache/ASCAD_desync50.h5",
+                "byte": 2,
+                "load_func": load_ascad,
+                "train_params": {"train_begin": 0, "train_end": 50000, "test_begin": 0, "test_end": 10000}
+            },
+            "ASCAD_desync100": {
+                "file_path": "/tmp/fast_datasets_cache/ASCAD_desync100.h5",
+                "byte": 2,
+                "load_func": load_ascad,
+                "train_params": {"train_begin": 0, "train_end": 50000, "test_begin": 0, "test_end": 10000}
+            },
+            "ASCAD_variable": {
+                "file_path": "/tmp/fast_datasets_cache/ASCAD_variable.h5",
+                "byte": 2,
+                "load_func": load_ascad,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 10000}
+            },
+            "ASCAD_variable_desync50": {
+                "file_path": "/tmp/fast_datasets_cache/ASCAD_variable_desync50.h5",
+                "byte": 2,
+                "load_func": load_ascad,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 20000}
+            },
+            "ASCAD_variable_desync100": {
+                "file_path": "/tmp/fast_datasets_cache/ASCAD_variable_desync100.h5",
+                "byte": 2,
+                "load_func": load_ascad,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 20000}
+            },
+            "ASCON": {
+                "file_path": "Dataset/ASCON/Ascon_AEAD_Initialization_first_round_dom_2shares.trs",
+                "byte": None,  # 由参数决定
+                "load_func": load_ascon_2,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 10000}
+            },
+            "AES_HD_ext": {
+                "file_path": "Dataset/AES_HD_ext/aes_hd_ext.h5",
+                "byte": None,  # 由参数决定
+                "load_func": load_aes_hd_ext,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 10000}
+            },
+            "AES_HD_ext_ID": {
+                "file_path": "Dataset/AES_HD_ext/aes_hd_ext.h5",
+                "byte": None,
+                "load_func": load_aes_hd_ext,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 10000}
+            },
+            "CTF": {
+                "file_path": "Dataset/CTF2018/ches_ctf.h5",
+                "byte": 0,
+                "load_func": load_ctf,
+                "train_params": {"train_begin": 0, "train_end": 45000, "test_begin": 0, "test_end": 10000}
+            },
+            "ChipWhisperer": {
+                "file_path": "Dataset/Chipwhisperer/",
+                "byte": None,
+                "load_func": load_chipwhisperer,
+                "train_params": {}
+            }
+        }
+        
+        if dataset not in configs:
+            raise ValueError(f"Unsupported dataset: {dataset}. Supported: {list(configs.keys())}")
+        
+        config = configs[dataset].copy()
+        config["file_path"] = os.path.join(root, config["file_path"])
+        return config
+    
+    @staticmethod
+    def load_dataset(dataset: str, leakage: str, byte: int, root: str = "./") -> tuple:
+        """
+        统一的数据集加载接口
+        """
+        config = DatasetLoader.get_dataset_config(dataset, root)
+        load_func = config["load_func"]
+        file_path = config["file_path"]
+        train_params = config["train_params"]
+        
+        print(f"📁 Loading dataset: {dataset}")
+        print(f"📂 File path: {file_path}")
+        
+        # 根据不同的加载函数调用相应的方法
+        if dataset == "ChipWhisperer":
+            return load_func(file_path, leakage_model=leakage)
+        elif dataset in ["ASCON"]:
+            return load_func(file_path, leakage_model=leakage, byte=byte, **train_params)
+        elif dataset in ["AES_HD_ext", "AES_HD_ext_ID"]:
+            return load_func(file_path, leakage_model=leakage, **train_params)
+        elif dataset == "CTF":
+            return load_func(file_path, leakage_model=leakage, byte=byte, **train_params)
+        else:  # ASCAD 系列
+            # ASCAD系列固定byte=2
+            actual_byte = config.get("byte", byte)
+            return load_func(file_path, leakage_model=leakage, byte=actual_byte, **train_params)
+
+
+class Custom_Dataset(Dataset):
+    def __init__(self, root: str = './', dataset: str = "ASCAD",
+                 leakage: str = "HW", transform: Optional[callable] = None,
+                 byte: int = 2, val_ratio: float = 0.1, random_state: int = 0):
+        """
+        统一的数据集类
+        
+        Args:
+            root: 数据根目录
+            dataset: 数据集名称
+            leakage: 泄漏模型 (HW/ID)
+            transform: 数据变换
+            byte: 目标字节
+            val_ratio: 验证集比例
+            random_state: 随机种子
+        """
+        
+        # 检查数据集是否被支持
+        try:
+            # 加载数据集
+            result = DatasetLoader.load_dataset(dataset, leakage, byte, root)
+            
+            if len(result) == 4:
+                (self.X_profiling, self.X_attack), (self.Y_profiling, self.Y_attack), \
+                (self.plt_profiling, self.plt_attack), self.correct_key = result
+            else:
+                raise ValueError(f"Unexpected return format from dataset loader for {dataset}")
+                
+        except Exception as e:
+            print(f"❌ Error loading dataset {dataset}: {str(e)}")
+            raise
+        
+        # 数据预处理
+        self.transform = transform
+        self.scaler_std = StandardScaler()
+        self.scaler = MinMaxScaler()
+        
+        # 标准化
+        self.X_profiling = self.scaler_std.fit_transform(self.X_profiling)
+        self.X_attack = self.scaler_std.transform(self.X_attack)
+
+        # 从profiling data中划分验证集
+        self.X_profiling, self.X_val, self.Y_profiling, self.Y_val, \
+        self.plt_profiling, self.plt_val = train_test_split(
+            self.X_profiling, self.Y_profiling, self.plt_profiling,
+            test_size=val_ratio, random_state=random_state, stratify=self.Y_profiling)
+
+        print(f"📊 Dataset loaded successfully:")
+        print(f"   Training set: {self.X_profiling.shape[0]} samples")
+        print(f"   Validation set: {self.X_val.shape[0]} samples")
+        print(f"   Test set: {self.X_attack.shape[0]} samples")
+        print(f"   Feature dimension: {self.X_profiling.shape[1]}")
+        print(f"   Leakage classes: {len(np.unique(self.Y_profiling))}")
+
+        print(f"📈 Data statistics:")
+        print(f"   X_profiling max: {np.max(self.X_profiling):.4f}")
+        print(f"   X_profiling min: {np.min(self.X_profiling):.4f}")
+
+    def apply_MinMaxScaler(self):
+        """应用MinMax归一化"""
+        self.X_profiling = self.scaler.fit_transform(self.X_profiling)
+        self.X_val = self.scaler.transform(self.X_val)
+        self.X_attack = self.scaler.transform(self.X_attack)
+        
+        print(f"📈 After MinMaxScaler:")
+        print(f"   X_profiling max: {np.max(self.X_profiling):.4f}")
+        print(f"   X_profiling min: {np.min(self.X_profiling):.4f}")
+
+    def _split_attack_set(self, val_ratio, random_state):
+        """从攻击集中划分验证集"""
+        X_rest, X_val, Y_rest, Y_val = train_test_split(
+            self.X_attack, self.Y_attack,
+            test_size=val_ratio, random_state=random_state,
+            stratify=self.Y_attack)
+        plt_rest, plt_val = train_test_split(
+            self.plt_attack, test_size=val_ratio,
+            random_state=random_state, stratify=self.Y_attack)
+        return X_rest, X_val, Y_rest, Y_val, plt_rest, plt_val
+
+    def choose_phase(self, phase):
+        """选择数据子集"""
+        if phase == 'train':
+            self.X, self.Y = np.expand_dims(self.X_profiling, 1), self.Y_profiling
+        elif phase == 'validation':
+            self.X, self.Y = np.expand_dims(self.X_val, 1), self.Y_val
+        elif phase == 'test':
+            self.X, self.Y = np.expand_dims(self.X_attack, 1), self.Y_attack
+        else:
+            raise ValueError(f"Unsupported phase: {phase}")
+        
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+    
+        trace = self.X[idx]
+        sensitive = self.Y[idx]
+        sample = {'trace': trace, 'sensitive': sensitive}
+        
+        if self.transform:
+            sample = self.transform(sample)
+    
+        return sample
+
+
+class ToTensor_trace(object):
+    """转换为PyTorch张量"""
+    
+    def __call__(self, sample):
+        trace, label = sample['trace'], sample['sensitive']
+        return {'trace': torch.from_numpy(trace).float(), 'sensitive': torch.tensor(label).long()}
